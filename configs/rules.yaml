@@ -1,0 +1,48 @@
+# Rule-Based Action Engine Configuration
+# Populated in Stage 6.
+# Rules are evaluated in order; first matching rule fires for a given station/timestep.
+
+thresholds:
+  queue_buildup_warning: 1.5    # ratio: predicted_queue / baseline_queue
+  queue_buildup_critical: 2.0
+  anomaly_sustained_steps: 5    # how many consecutive flagged steps = "sustained"
+
+rules:
+  # Rule 1: Queue buildup — reduce input rate at feeder
+  - id: "QUEUE_BUILDUP_WARNING"
+    condition: "queue_depth_forecast_ratio > queue_buildup_warning"
+    recommendation: "REDUCE_INPUT_RATE"
+    target: "upstream_feeder"
+    severity: "WARNING"
+    message: "Predicted queue buildup at {station} (ratio={ratio:.2f}). Recommend reducing input rate at {feeder}."
+
+  - id: "QUEUE_BUILDUP_CRITICAL"
+    condition: "queue_depth_forecast_ratio > queue_buildup_critical"
+    recommendation: "FLAG_SUPERVISOR_REVIEW"
+    target: "upstream_feeder"
+    severity: "CRITICAL"
+    message: "Critical queue buildup predicted at {station} (ratio={ratio:.2f}). Supervisor review required at {feeder}."
+
+  # Rule 2: Anomaly with attribution — inspect origin station
+  - id: "ANOMALY_WITH_ATTRIBUTION"
+    condition: "anomaly_flagged AND attribution_confidence > 0.5"
+    recommendation: "INSPECT_ORIGIN"
+    target: "attribution_origin"
+    severity: "WARNING"
+    message: "Anomaly at {station} attributed to {origin} (confidence={confidence:.0%}). Inspect {origin} — not every downstream station."
+
+  # Rule 3: Anomaly without clear attribution — flag for general review
+  - id: "ANOMALY_NO_ATTRIBUTION"
+    condition: "anomaly_flagged AND attribution_confidence <= 0.5"
+    recommendation: "FLAG_SUPERVISOR_REVIEW"
+    target: "flagged_station"
+    severity: "INFO"
+    message: "Anomaly at {station} with low attribution confidence. Flag for supervisor review."
+
+  # Rule 4: Defect pattern detected
+  - id: "DEFECT_DETECTED"
+    condition: "anomaly_type == defect"
+    recommendation: "HALT_QUALITY_CHECK"
+    target: "flagged_station"
+    severity: "CRITICAL"
+    message: "Defect pattern detected at {station}. Recommend halting output for quality check."

@@ -1,0 +1,102 @@
+# Assembly Line Configuration
+# 18 stations: ~72% well-instrumented, ~17% proxy-only, ~11% manual
+
+line:
+  name: "Vehicle Assembly Line Alpha"
+  n_stations: 18
+  timestep_minutes: 1           # 1 minute per simulation step
+  default_run_hours: 4          # default simulation length
+
+stations:
+  # Format: id, name, type, baseline_cycle_time_s
+  # type: well_instrumented | proxy_only | manual
+  - id: 0
+    name: "Body Panel Stamping"
+    type: well_instrumented
+    baseline_cycle_s: 55
+  - id: 1
+    name: "Door Frame Welding"
+    type: well_instrumented
+    baseline_cycle_s: 72
+  - id: 2
+    name: "Roof Assembly"
+    type: well_instrumented
+    baseline_cycle_s: 68
+  - id: 3
+    name: "Underbody Framing"
+    type: well_instrumented
+    baseline_cycle_s: 80
+  - id: 4
+    name: "Engine Bay Prep"
+    type: proxy_only
+    baseline_cycle_s: 65
+  - id: 5
+    name: "Powertrain Install"
+    type: well_instrumented
+    baseline_cycle_s: 90
+  - id: 6
+    name: "Transmission Coupling"
+    type: well_instrumented
+    baseline_cycle_s: 75
+  - id: 7
+    name: "Suspension Assembly"
+    type: well_instrumented
+    baseline_cycle_s: 85
+  - id: 8
+    name: "Brake Line Routing"
+    type: proxy_only
+    baseline_cycle_s: 60
+  - id: 9
+    name: "Fuel System Install"
+    type: well_instrumented
+    baseline_cycle_s: 70
+  - id: 10
+    name: "Electrical Harness"
+    type: well_instrumented
+    baseline_cycle_s: 95
+  - id: 11
+    name: "HVAC Install"
+    type: manual
+    baseline_cycle_s: 78
+  - id: 12
+    name: "Interior Trim"
+    type: well_instrumented
+    baseline_cycle_s: 62
+  - id: 13
+    name: "Dashboard Assembly"
+    type: well_instrumented
+    baseline_cycle_s: 88
+  - id: 14
+    name: "Glass Install"
+    type: well_instrumented
+    baseline_cycle_s: 55
+  - id: 15
+    name: "Seating Install"
+    type: proxy_only
+    baseline_cycle_s: 65
+  - id: 16
+    name: "Exterior Finishing"
+    type: well_instrumented
+    baseline_cycle_s: 72
+  - id: 17
+    name: "Final QC Inspection"
+    type: manual
+    baseline_cycle_s: 120
+
+sensors:
+  true_signals:
+    - temperature    # °C, station tooling temperature
+    - vibration      # mm/s RMS, spindle/actuator vibration
+    - torque         # Nm, fastening torque applied
+  proxy_signals:
+    - motor_current  # A, drive motor current draw
+    - setpoint_error # dimensionless, (commanded - actual) / commanded
+    - cycle_duration # s, actual measured cycle time
+
+noise:
+  cycle_time_sigma_frac: 0.05   # ±5% of baseline cycle time
+  sensor_sigma_frac: 0.03       # ±3% of sensor baseline
+  proxy_sigma_frac: 0.05        # ±5% additional proxy noise
+
+queue:
+  ema_alpha: 0.3    # EMA weight for queue ripple propagation

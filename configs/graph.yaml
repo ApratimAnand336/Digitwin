@@ -1,0 +1,43 @@
+# Station Graph Configuration
+# Directed edges: physical flow order  station_i → station_{i+1}
+# Node IDs match station IDs in line_config.yaml
+
+nodes:
+  - {id: 0,  name: "Body Panel Stamping"}
+  - {id: 1,  name: "Door Frame Welding"}
+  - {id: 2,  name: "Roof Assembly"}
+  - {id: 3,  name: "Underbody Framing"}
+  - {id: 4,  name: "Engine Bay Prep"}
+  - {id: 5,  name: "Powertrain Install"}
+  - {id: 6,  name: "Transmission Coupling"}
+  - {id: 7,  name: "Suspension Assembly"}
+  - {id: 8,  name: "Brake Line Routing"}
+  - {id: 9,  name: "Fuel System Install"}
+  - {id: 10, name: "Electrical Harness"}
+  - {id: 11, name: "HVAC Install"}
+  - {id: 12, name: "Interior Trim"}
+  - {id: 13, name: "Dashboard Assembly"}
+  - {id: 14, name: "Glass Install"}
+  - {id: 15, name: "Seating Install"}
+  - {id: 16, name: "Exterior Finishing"}
+  - {id: 17, name: "Final QC Inspection"}
+
+# Sequential chain: each station feeds exactly the next one
+edges:
+  - {src: 0,  dst: 1}
+  - {src: 1,  dst: 2}
+  - {src: 2,  dst: 3}
+  - {src: 3,  dst: 4}
+  - {src: 4,  dst: 5}
+  - {src: 5,  dst: 6}
+  - {src: 6,  dst: 7}
+  - {src: 7,  dst: 8}
+  - {src: 8,  dst: 9}
+  - {src: 9,  dst: 10}
+  - {src: 10, dst: 11}
+  - {src: 11, dst: 12}
+  - {src: 12, dst: 13}
+  - {src: 13, dst: 14}
+  - {src: 14, dst: 15}
+  - {src: 15, dst: 16}
+  - {src: 16, dst: 17}
