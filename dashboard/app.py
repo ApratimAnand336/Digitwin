@@ -46,23 +46,7 @@ with st.spinner("Initialising Assembly Line Digital Twin … (first load trains 
 # ─────────────────────────────────────────────────────────────────────────────
 #  Pre-warm aggregate stats (step through entire run once)
 # ─────────────────────────────────────────────────────────────────────────────
-@st.cache_data
-def build_aggregate(_api_id: int) -> dict:
-    """Walk the entire run so aggregate stats are available for all three tabs."""
-    for t in range(15, _api.max_t + 1):   # noqa: F821 – resolved below
-        _api.get_state(t)
-    return _api.get_aggregate_stats()
-
-# Workaround: st.cache_data can't hash the API object, so we step manually
-if "agg_ready" not in st.session_state:
-    prog = st.progress(0, text="Pre-computing full run …")
-    total = api.max_t - 15 + 1
-    for _t in range(15, api.max_t + 1):
-        api.get_state(_t)
-        prog.progress((_t - 14) / total)
-    prog.empty()
-    st.session_state["agg_ready"] = True
-
+# api.py pre-computes everything at init — just get aggregate stats
 agg = api.get_aggregate_stats()
 
 # ─────────────────────────────────────────────────────────────────────────────

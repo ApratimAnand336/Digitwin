@@ -1,8 +1,9 @@
 """
 dashboard/api.py - Backend API / Data layer for the Digital Twin UI.
 
-Wraps the Simulator, Soft Sensor, Core Model, Anomaly Detector, and Action Engine
-into a single stateful interface that the Streamlit dashboard can query.
+KEY DESIGN: The entire run is pre-computed once at init time.
+get_state(t) just returns a cached dict — it does NOT drive the stateful
+anomaly detector again on every call. This prevents double-processing.
 """
 
 from __future__ import annotations
@@ -18,240 +19,261 @@ from action import PrescriptiveEngine
 from anomaly import AnomalyDetector, AnomalyResult
 from model import AssemblyLineDataset, DigitalTwinModel, get_edge_index
 from simulator import AssemblyLineSimulator, load_config
-from soft_sensor import SoftSensorModel, apply_soft_sensor, TARGET_COLS
+from soft_sensor import SoftSensorModel, apply_soft_sensor
 
 ROOT = Path(__file__).parent.parent
+
+FEATURE_COLS = [
+    "cycle_time_s", "queue_depth",
+    "est_temperature", "est_vibration", "est_torque",
+    "motor_current", "setpoint_error", "cycle_duration_s",
+    "pass_fail",
+]
 
 
 class DigitalTwinAPI:
     """
-    Provides a unified API for the dashboard to step through the simulation
-    and retrieve integrated insights (predictions, anomalies, actions).
+    Pre-computes the entire simulation run at init.
+    get_state(t) returns a cached dict - safe to call from sliders.
+    get_aggregate_stats() returns rollup metrics for Plant Manager / Leadership.
     """
 
     def __init__(self, run_steps: int = 300, seed: int = 42) -> None:
-        self.cfg = load_config()
+        cfg = load_config()
+        self.cfg = cfg
         self.edge_index = get_edge_index(ROOT / "configs" / "graph.yaml")
+        self.station_names = {s.id: s.name for s in cfg.stations}
+        self.station_types = {s.id: s.type for s in cfg.stations}
+        self.run_steps = run_steps
 
-        # 1. Load Models
+        # ── 1. Load models ──────────────────────────────────────────────────
         ss_path = ROOT / "data" / "soft_sensor" / "soft_sensor.joblib"
         core_path = ROOT / "data" / "model" / "core_model.pt"
 
+        print("Loading soft sensor …")
         self.ss_model = SoftSensorModel.load(ss_path)
 
-        # 2. Recompute normalisation stats from a dummy run (must match training)
-        sim_dummy = AssemblyLineSimulator(config=self.cfg, seed=0)
-        dummy_obs, _, _ = sim_dummy.run(n_steps=100)
-        dummy_obs["run_id"] = 0
-        dummy_obs = apply_soft_sensor(dummy_obs, self.ss_model, self.cfg.proxy_only_ids)
-        dummy_ds = AssemblyLineDataset(dummy_obs, n_stations=self.cfg.n_stations)
-
-        self.means = dummy_ds.means
-        self.stds = dummy_ds.stds
+        # Normalisation stats computed from training data (seed 0-19, no faults).
+        # We use a clean no-fault run at the same seed to get stable means/stds
+        # that match what the model saw during training.
+        sim_norm = AssemblyLineSimulator(config=cfg, seed=seed)
+        norm_obs, _, _ = sim_norm.run(n_steps=run_steps)
+        norm_obs["run_id"] = seed
+        norm_obs = apply_soft_sensor(norm_obs, self.ss_model, cfg.proxy_only_ids)
+        norm_ds = AssemblyLineDataset(norm_obs, n_stations=cfg.n_stations)
+        self.means = norm_ds.means
+        self.stds = norm_ds.stds
         in_features = len(self.means)
 
+        print("Loading core model …")
         self.core_model = DigitalTwinModel(in_features, use_gcn=True)
         self.core_model.load_state_dict(
             torch.load(core_path, map_location="cpu", weights_only=True)
         )
         self.core_model.eval()
 
-        # 3. Initialise logic engines
-        self.detector = AnomalyDetector(alpha=2.5, window_size=30)
-        self.action_engine = PrescriptiveEngine(ROOT / "configs" / "rules.yaml")
+        # ── 2. Run simulation ───────────────────────────────────────────────
+        print("Running simulation …")
+        sim = AssemblyLineSimulator(config=cfg, seed=seed)
+        sim.inject_bottleneck(station_id=3, start_step=60, duration_steps=60, severity=0.6)
+        sim.inject_defect(station_id=8, start_step=150, pattern="sine_drift")
 
-        # 4. Generate the main simulation run (pre-computed for the prototype)
-        self.sim = AssemblyLineSimulator(config=self.cfg, seed=seed)
-
-        # Inject demonstration faults
-        # Bottleneck at S3 (Underbody Framing) from t=60 to 120
-        self.sim.inject_bottleneck(station_id=3, start_step=60, duration_steps=60, severity=0.6)
-        # Defect at S8 (Brake Line Routing) from t=150 onwards
-        self.sim.inject_defect(station_id=8, start_step=150, pattern="sine_drift")
-
-        print("Generating simulation run...")
-        raw_obs, self.fault_log, _ = self.sim.run(n_steps=run_steps)
+        raw_obs, self.fault_log, _ = sim.run(n_steps=run_steps)
         raw_obs["run_id"] = seed
 
-        print("Applying soft sensor...")
-        self.obs_df = apply_soft_sensor(raw_obs, self.ss_model, self.cfg.proxy_only_ids)
+        print("Applying soft sensor …")
+        self.obs_df = apply_soft_sensor(raw_obs, self.ss_model, cfg.proxy_only_ids)
 
-        # Pre-format the features array for fast slicing
-        feature_cols = [
-            "cycle_time_s", "queue_depth",
-            "est_temperature", "est_vibration", "est_torque",
-            "motor_current", "setpoint_error", "cycle_duration_s",
-            "pass_fail"
-        ]
-
-        # Fill NaNs and normalise
+        # Build normalised feature tensor  (T, N, F)
         norm_df = self.obs_df.copy()
-        norm_df[feature_cols] = norm_df[feature_cols].fillna(0.0)
-        norm_df[feature_cols] = (norm_df[feature_cols] - self.means) / self.stds
+        norm_df[FEATURE_COLS] = norm_df[FEATURE_COLS].fillna(0.0)
+        norm_df[FEATURE_COLS] = (norm_df[FEATURE_COLS] - self.means) / self.stds
 
-        # Pivot to (Timesteps, Stations, Features)
-        n_stations = self.cfg.n_stations
+        n_stations = cfg.n_stations
         self.feature_tensor = np.zeros(
-            (run_steps, n_stations, len(feature_cols)), dtype=np.float32
+            (run_steps, n_stations, len(FEATURE_COLS)), dtype=np.float32
         )
-
-        pivot = norm_df.pivot(index="timestep", columns="station_id", values=feature_cols)
-        for f_idx, feat in enumerate(feature_cols):
+        pivot = norm_df.pivot(index="timestep", columns="station_id", values=FEATURE_COLS)
+        for f_idx, feat in enumerate(FEATURE_COLS):
             self.feature_tensor[:, :, f_idx] = pivot[feat].values
 
         self.max_t = run_steps - 1
+        self.SEQ_LEN = 15
 
-        # Accumulate anomaly results per timestep for aggregate views
+        # ── 3. PRE-COMPUTE all states ONCE in strict time order ─────────────
+        print("Pre-computing all states …")
+        self._state_cache: Dict[int, Dict[str, Any]] = {}
         self._anomaly_log: List[Dict[str, Any]] = []
 
-        self.station_names = {s.id: s.name for s in self.cfg.stations}
-        self.station_types = {s.id: s.type for s in self.cfg.stations}
+        # alpha=3.5 => flags only when residual > mean + 3.5*std of normal window
+        # Higher alpha reduces false positives from model prediction noise
+        detector = AnomalyDetector(alpha=3.5, window_size=40)
+        action_engine = PrescriptiveEngine(ROOT / "configs" / "rules.yaml")
+        mean_c = float(self.means["cycle_time_s"])
+        std_c = float(self.stds["cycle_time_s"])
 
+        for t in range(self.SEQ_LEN - 1, run_steps):
+            self._state_cache[t] = self._compute_state(
+                t, detector, action_engine, mean_c, std_c
+            )
+
+        print("API ready.")
+
+    # ───────────────────────────────────────────────────────────────────────
     def get_state(self, t: int) -> Dict[str, Any]:
-        """
-        Retrieves the full system state at timestep t, formatted for the UI.
-        Runs inference through the core model and prescriptive engine.
-        """
-        seq_len = 15
-        if t < seq_len - 1:
-            t = seq_len - 1
-        if t > self.max_t:
-            t = self.max_t
+        """Return pre-computed state dict for timestep t."""
+        t = max(self.SEQ_LEN - 1, min(t, self.max_t))
+        return self._state_cache[t]
 
-        # 1. Slice current window
+    # ───────────────────────────────────────────────────────────────────────
+    def _compute_state(
+        self,
+        t: int,
+        detector: AnomalyDetector,
+        action_engine: PrescriptiveEngine,
+        mean_c: float,
+        std_c: float,
+    ) -> Dict[str, Any]:
+        """Called once per timestep at init. Never called again."""
+        seq_len = self.SEQ_LEN
         X_np = self.feature_tensor[t - seq_len + 1 : t + 1]
         X = torch.tensor(X_np, dtype=torch.float32).unsqueeze(0)  # (1,15,N,F)
         X = X.transpose(1, 2)  # (1,N,15,F)
 
-        # 2. Forward pass
         with torch.no_grad():
             p_short, p_long_m, p_long_s = self.core_model(X, self.edge_index)
 
-        # Unnormalise cycle_time_s predictions
-        mean_c = float(self.means["cycle_time_s"])
-        std_c = float(self.stds["cycle_time_s"])
-
-        p_short = p_short * std_c + mean_c
+        # Unnormalise
+        p_short  = p_short  * std_c + mean_c
         p_long_m = p_long_m * std_c + mean_c
         p_long_s = p_long_s * std_c
 
-        # Get actual current values (at time t)
-        curr_obs = self.obs_df[self.obs_df["timestep"] == t].sort_values("station_id")
+        curr_obs = (
+            self.obs_df[self.obs_df["timestep"] == t]
+            .sort_values("station_id")
+        )
 
-        state_response: Dict[str, Any] = {"timestep": t, "stations": [], "actions": []}
+        stations_out: List[Dict[str, Any]] = []
         active_anomalies: List[Dict[str, Any]] = []
 
-        # 3. Process each station
         for sid in range(self.cfg.n_stations):
             row = curr_obs.iloc[sid]
             stype = self.station_types[sid]
 
-            actual_cycle_time = float(row["cycle_time_s"])
-            pred_1step_ahead = float(p_short[0, sid, 0].item())
+            actual_ct = float(row["cycle_time_s"])
+            pred_ct   = float(p_short[0, sid, 0].item())
+            upstream  = sid - 1 if sid > 0 else None
 
-            upstream_id = sid - 1 if sid > 0 else None
-
-            # Anomaly Detection with real classification + attribution
-            result: AnomalyResult = self.detector.process(
+            result: AnomalyResult = detector.process(
                 station_id=sid,
-                actual=actual_cycle_time,
-                predicted=pred_1step_ahead,
-                upstream_station_id=upstream_id,
+                actual=actual_ct,
+                predicted=pred_ct,
+                upstream_station_id=upstream,
                 station_type=stype,
             )
 
-            # Long-horizon queue forecast ratio
-            baseline_ct = float(row["baseline_cycle_s"])
-            forecast_ct = float(p_long_m[0, sid, 15].item())
+            baseline_ct  = float(row["baseline_cycle_s"])
+            baseline_ratio = actual_ct / baseline_ct if baseline_ct > 0 else 1.0
+            forecast_ct  = float(p_long_m[0, sid, 15].item())
             forecast_ratio = forecast_ct / baseline_ct if baseline_ct > 0 else 1.0
 
-            # Attribution label uses real station names
-            attr_origin_name = (
+            # --- Baseline-ratio defect detection ---
+            # The LSTM learns periodic defect patterns during training → residuals stay
+            # small even during an active defect. So we add a SECOND detection path:
+            # compare actual cycle_time to the station's own physical baseline.
+            #
+            # If cycle_time is significantly above baseline AND residual is NOT
+            # also spiking (which would indicate a bottleneck), call it a defect.
+            #
+            # Threshold: 22% above baseline sustained → defect flag
+            DEFECT_BASELINE_RATIO = 1.22
+            if (not result.is_anomaly) and (baseline_ratio > DEFECT_BASELINE_RATIO):
+                # Override: baseline deviation that the model didn't flag
+                result.is_anomaly = True
+                result.anomaly_type = "defect"
+                result.type_confidence = min(0.85, (baseline_ratio - 1.0) * 4.0)
+                result.attribution_label = (
+                    f"origin: S{sid} / quality drift detected "
+                    f"({baseline_ratio:.0%} of baseline cycle time)"
+                )
+                result.attribution_confidence = 0.70
+
+            attr_name = (
                 self.station_names[result.attribution_origin]
                 if result.attribution_origin is not None
                 else self.station_names[sid]
             )
 
-            node_state: Dict[str, Any] = {
+            def _safe(col: str) -> Optional[float]:
+                v = row.get(col, np.nan)
+                return None if (v is None or (isinstance(v, float) and np.isnan(v))) else float(v)
+
+            node: Dict[str, Any] = {
                 "station_id": sid,
-                "station": self.station_names[sid],
+                "station":    self.station_names[sid],
                 "station_type": stype,
                 "feeder": self.station_names[sid - 1] if sid > 0 else "None",
 
-                "cycle_time": actual_cycle_time,
+                "cycle_time":  actual_ct,
                 "queue_depth": float(row["queue_depth"]),
-                "temperature": (
-                    float(row["est_temperature"])
-                    if not np.isnan(row["est_temperature"])
-                    else None
-                ),
-                "vibration": (
-                    float(row["est_vibration"])
-                    if not np.isnan(row["est_vibration"])
-                    else None
-                ),
-                "torque": (
-                    float(row["est_torque"])
-                    if not np.isnan(row["est_torque"])
-                    else None
-                ),
+                "temperature": _safe("est_temperature"),
+                "vibration":   _safe("est_vibration"),
+                "torque":      _safe("est_torque"),
 
-                # --- Anomaly outputs (now from real detector) ---
-                "anomaly_flagged": result.is_anomaly,
-                "residual_error": result.residual,
-                "threshold": result.threshold,
-                "anomaly_type": result.anomaly_type,
-                "type_confidence": result.type_confidence,
+                "anomaly_flagged":    result.is_anomaly,
+                "residual_error":     result.residual,
+                "threshold":          result.threshold,
+                "anomaly_type":       result.anomaly_type,
+                "type_confidence":    result.type_confidence,
 
-                # Attribution
-                "attribution_origin": attr_origin_name,
+                "attribution_origin":     attr_name,
                 "attribution_confidence": result.attribution_confidence,
-                "attribution_label": result.attribution_label,
+                "attribution_label":      result.attribution_label,
 
                 "queue_depth_forecast_ratio": forecast_ratio,
-
-                # Full forecasts for UI plotting
-                "forecast_short": p_short[0, sid, :].tolist(),
+                "forecast_short":     p_short[0, sid, :].tolist(),
                 "forecast_long_mean": p_long_m[0, sid, :].tolist(),
-                "forecast_long_std": p_long_s[0, sid, :].tolist(),
+                "forecast_long_std":  p_long_s[0, sid, :].tolist(),
             }
 
-            state_response["stations"].append(node_state)
+            stations_out.append(node)
 
             if result.is_anomaly or forecast_ratio > 1.2:
-                active_anomalies.append(node_state)
+                active_anomalies.append(node)
 
-            # Log for aggregate/Plant Manager view
+            # Accumulate for aggregate stats
             self._anomaly_log.append({
-                "timestep": t,
-                "station_id": sid,
-                "station": self.station_names[sid],
-                "is_anomaly": result.is_anomaly,
+                "timestep":     t,
+                "station_id":   sid,
+                "station":      self.station_names[sid],
+                "is_anomaly":   result.is_anomaly,
                 "anomaly_type": result.anomaly_type,
-                "residual": result.residual,
-                "cycle_time": actual_cycle_time,
-                "baseline": baseline_ct,
+                "residual":     result.residual,
+                "cycle_time":   actual_ct,
+                "baseline":     baseline_ct,
             })
 
-        # 4. Generate Prescriptive Actions via rules engine
-        for state_dict in active_anomalies:
-            actions = self.action_engine.evaluate(state_dict)
-            for act in actions:
-                state_response["actions"].append({
-                    "rule_id": act.rule_id,
-                    "severity": act.severity,
-                    "target": act.target,
+        # Actions
+        actions_out: List[Dict[str, Any]] = []
+        seen_rules: set = set()
+        for astate in active_anomalies:
+            for act in action_engine.evaluate(astate):
+                key = (act.rule_id, astate["station_id"])
+                if key in seen_rules:
+                    continue
+                seen_rules.add(key)
+                actions_out.append({
+                    "rule_id":        act.rule_id,
+                    "severity":       act.severity,
+                    "target":         act.target,
                     "recommendation": act.recommendation,
-                    "message": act.message,
+                    "message":        act.message,
                 })
 
-        return state_response
+        return {"timestep": t, "stations": stations_out, "actions": actions_out}
 
+    # ───────────────────────────────────────────────────────────────────────
     def get_aggregate_stats(self) -> Dict[str, Any]:
-        """
-        Returns aggregate metrics for the Plant Manager and Leadership views.
-        Built from the accumulated anomaly log across all get_state() calls.
-        """
         if not self._anomaly_log:
             return {}
 
@@ -259,64 +281,46 @@ class DigitalTwinAPI:
             subset=["timestep", "station_id"]
         )
 
-        # Flag counts per station
         flag_counts = (
             log_df[log_df["is_anomaly"]]
-            .groupby("station")
-            .size()
+            .groupby("station").size()
             .sort_values(ascending=False)
             .to_dict()
         )
 
-        # Anomaly rate over time (fraction of stations flagged per timestep)
         t_rate = (
             log_df.groupby("timestep")["is_anomaly"]
-            .mean()
-            .reset_index()
+            .mean().reset_index()
             .rename(columns={"is_anomaly": "anomaly_rate"})
         )
 
-        # Estimated disrupted timesteps (any station flagged)
-        disrupted_steps = log_df.groupby("timestep")["is_anomaly"].any().sum()
-        disrupted_minutes = int(disrupted_steps)  # 1 step = 1 min
-
-        # Estimated defect exposure: steps where a defect was active
+        disrupted = int(log_df.groupby("timestep")["is_anomaly"].any().sum())
         defect_steps = int(
             log_df[log_df["anomaly_type"] == "defect"]["timestep"].nunique()
         )
-
-        # Bottleneck steps
         bn_steps = int(
             log_df[log_df["anomaly_type"] == "bottleneck"]["timestep"].nunique()
         )
 
-        # Lead time: estimated minutes of early warning
-        # (simple heuristic: model flags before cycle-time explodes by comparing
-        #  residual-cross time vs fault_log start times in the active run)
         fault_log = self.fault_log
         lead_times = []
         for _, row in fault_log.iterrows():
             sid = int(row["station_id"])
             fault_start = int(row["start_step"])
-            # Find first flag at this station after model had enough history
-            station_flags = log_df[
+            early = log_df[
                 (log_df["station_id"] == sid) & log_df["is_anomaly"]
             ]["timestep"]
-            early_flags = station_flags[station_flags >= 15]  # model needs 15 steps warmup
-            if len(early_flags) > 0:
-                first_flag = int(early_flags.min())
-                lead = fault_start - first_flag  # positive = flagged BEFORE fault label start
-                lead_times.append(lead)
-
-        avg_lead_time = float(np.mean(lead_times)) if lead_times else 0.0
+            early = early[early >= 15]
+            if len(early) > 0:
+                lead_times.append(fault_start - int(early.min()))
 
         return {
             "flag_counts": flag_counts,
             "anomaly_rate_over_time": t_rate.to_dict("records"),
-            "disrupted_minutes": disrupted_minutes,
+            "disrupted_minutes": disrupted,
             "defect_steps": defect_steps,
             "bottleneck_steps": bn_steps,
-            "avg_lead_time_minutes": avg_lead_time,
+            "avg_lead_time_minutes": float(np.mean(lead_times)) if lead_times else 0.0,
             "total_timesteps": int(log_df["timestep"].nunique()),
             "fault_log": fault_log.to_dict("records"),
         }

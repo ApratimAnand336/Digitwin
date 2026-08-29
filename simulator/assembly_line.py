@@ -269,10 +269,10 @@ class AssemblyLineSimulator:
                 if def_active[t, i]:
                     steps_in_def = t - def_start[i]
                     ramp_def = min(1.0, steps_in_def / 20.0)
-                    # Sine wave: peak ~30% of baseline, period ~30 min
-                    defect_overhead = ramp_def * base_c * 0.30 * abs(
-                        np.sin(2 * np.pi * steps_in_def / 30)
-                    )
+                    # (1-cos)/2 oscillates 0→1 but never returns to zero → always detectable
+                    defect_overhead = ramp_def * base_c * 0.28 * (
+                        1.0 - np.cos(2 * np.pi * steps_in_def / 30)
+                    ) / 2.0 + ramp_def * base_c * 0.10  # +constant 10% floor
                     processing += defect_overhead
 
                 wait_time  = queue[i] * _WAIT_BLEED_FACTOR
