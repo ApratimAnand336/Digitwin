@@ -121,8 +121,8 @@ during a bottleneck injected at S3 (5-minute ahead forecast):
 
 | Model | Station N+2 (S5) MAE during bottleneck |
 |---|---|
-| LSTM only | **4.58 s** |
-| LSTM + GCN | **3.82 s** (16% better) |
+| LSTM only | **6.23 s** |
+| LSTM + GCN | **4.78 s** (23% better) |
 
 The GCN layer allows S5's representation to be informed by S3's hidden state,
 so the model anticipates the queue wave before it physically arrives.

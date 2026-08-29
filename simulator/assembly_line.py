@@ -261,6 +261,20 @@ class AssemblyLineSimulator:
                 bn_factor  = 1.0 + bn_sev[t, i] if bn_active[t, i] else 1.0
                 noise_c    = rng.normal(0.0, nc * base_c)
                 processing = base_c * bn_factor + noise_c
+
+                # Defect: sinusoidal rework overhead — operators slow down as
+                # they attempt to correct the defective output pattern.
+                # This makes the defect OBSERVABLE via cycle_time (not just quality).
+                # Oscillating pattern (not sustained) distinguishes it from a bottleneck.
+                if def_active[t, i]:
+                    steps_in_def = t - def_start[i]
+                    ramp_def = min(1.0, steps_in_def / 20.0)
+                    # Sine wave: peak ~30% of baseline, period ~30 min
+                    defect_overhead = ramp_def * base_c * 0.30 * abs(
+                        np.sin(2 * np.pi * steps_in_def / 30)
+                    )
+                    processing += defect_overhead
+
                 wait_time  = queue[i] * _WAIT_BLEED_FACTOR
                 cycle_time = max(processing + wait_time, base_c * 0.4)
                 cur_cycle[i] = cycle_time
@@ -293,10 +307,12 @@ class AssemblyLineSimulator:
                     + load_rel * 9.0
                     + bn_active[t, i] * bn_sev[t, i] * 6.0
                 )
-                # Defect: subtle torque oscillation (fastening quality drifts)
+                # Defect: subtle torque oscillation (fastening quality drifts).
+                # BUG FIX: was using bn_sev[t,i] which is 0 for defects.
+                # Now uses a fixed defect severity (0.35) so torque actually oscillates.
                 if def_active[t, i]:
                     steps_in = t - def_start[i]
-                    torque_state[i] += bn_sev[t, i] * 4.0 * np.sin(2 * np.pi * steps_in / 25)
+                    torque_state[i] += 0.35 * 4.0 * np.sin(2 * np.pi * steps_in / 25)
                 torque = max(1.0, torque_state[i] + rng.normal(0.0, ns * self._torque_base[i]))
 
                 # ---------- Output quality ----------
